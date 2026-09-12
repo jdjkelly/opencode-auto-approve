@@ -1,0 +1,28 @@
+{
+  "name": "opencode-auto-approve",
+  "description": "An LLM approval classifier (auto mode) for OpenCode V2: cascade judges, a tiered policy, and a deterministic deny floor.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jdjkelly/opencode-auto-approve.git"
+  },
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./dist/tui.js",
+    "./rpc": "./rpc.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.2"
+  },
+  "devDependencies": {
+    "@babel/core": "7.28.0",
+    "@babel/preset-typescript": "7.27.1",
+    "babel-preset-solid": "1.9.12",
+    "esbuild": "0.25.12"
+  },
+  "scripts": {
+    "compile:tui": "node build.mjs"
+  }
+}
