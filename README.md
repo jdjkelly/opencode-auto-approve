@@ -14,10 +14,10 @@ Requires OpenCode V2 with `permission.evaluate`, `prompt.footer`, `session.panel
 opencode2 plugin add github:jdjkelly/opencode-auto-approve
 ```
 
-Install the pinned release with `#v0.1.0` instead:
+Install the pinned release with `#v0.1.1` instead:
 
 ```sh
-opencode2 plugin add github:jdjkelly/opencode-auto-approve#v0.1.0
+opencode2 plugin add github:jdjkelly/opencode-auto-approve#v0.1.1
 ```
 
 If your executable is named `opencode`, replace `opencode2` in these commands. Restart OpenCode after installing, then run `/auto-approve` in any session.
