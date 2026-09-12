@@ -268,8 +268,10 @@ function asObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
 }
 
-export default Plugin.define({
+/** `tui: true` marks that this package ships a TUI half (`./tui`), which the host loads for package installs. */
+const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
   id: "auto-approve",
+  tui: true,
   async setup(ctx) {
     const configRoot = process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config")
     const globalOptionsFile = path.join(configRoot, "opencode", "auto-approve.json")
@@ -540,4 +542,6 @@ export default Plugin.define({
       void permissionRegistration.dispose()
     }
   },
-})
+}
+
+export default Plugin.define(definition)
