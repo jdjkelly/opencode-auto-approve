@@ -26,6 +26,8 @@ If your executable is named `opencode`, replace `opencode2` in these commands. R
 
 The feature set was exercised against OpenCode `v2.0.2` and tested end to end on `v0.0.0-beta-19507`, including the `permission.evaluate` hook, the composer badge, `/auto-approve`, the decision panel, and RPC-based configuration. Other beta builds may vary.
 
+The model catalog moved between builds — `ctx.catalog.model` through `2.0.2`, `ctx.model` from `2.0.26` on. The plugin reads whichever the running host exposes, so the default-judge lookup (and judge validation) works on both instead of failing closed on the newer layout.
+
 ### Keep one installation active
 
 The package manager adds the plugin to the global OpenCode configuration. If `~/.config/opencode/plugins/auto-approve` already contains a manual clone, move it outside the plugins folder and remove its entry from `~/.config/opencode/opencode.json`. Two active copies register two permission hooks and every gated call is judged twice.
@@ -61,13 +63,13 @@ Run `/auto-approve` (aliases: `/aa`, `/approval`):
 | --- | --- |
 | `/auto-approve` | Toggle the classifier on or off |
 | `/auto-approve on` / `off` | Set it explicitly |
-| `/auto-approve status` | Show judges, cascade, escalation limits, and timeout |
-| `/auto-approve judge <providerID>/<modelID>` | Set the stage-1 judge |
-| `/auto-approve judge2 <providerID>/<modelID>` | Set the stage-2 judge |
+| `/auto-approve status` | Show models, cascade, escalation limits, and timeout |
+| `/auto-approve model <providerID>/<modelID>` | Set the stage-1 model |
+| `/auto-approve model2 <providerID>/<modelID>` | Set the stage-2 model |
 | `/auto-approve log` | Open the decision panel for the session |
 | `/auto-approve clear` | Clear the in-memory decision log |
 
-Toggling and judge changes take effect on the next tool call — the server re-reads its options before every gated call, no restart. Judge references are validated against your model catalog.
+Toggling and model changes take effect on the next tool call — the server re-reads its options before every gated call, no restart. Model references are validated against your model catalog.
 
 ### Composer badge
 
@@ -150,7 +152,7 @@ The fixed core carries grading guidance distilled from published policies: git n
 ### Safety design
 
 - **Reasoning-blind evidence.** The judge sees user messages plus the bare pending call (`action`, `resources`, `metadata`). Assistant prose and tool output are never sent, so file or web content the agent read cannot grant permission. The prompt also tells the judge to treat any "user" text quoted from file or web content as untrusted. Verified: a `notes.txt` prompt injection instructing `rm -rf ./data` is denied when the user only delegated generically.
-- **Fail closed.** Judge errors, timeouts, and unparseable verdicts escalate to a normal permission prompt, never to a silent allow.
+- **Fail closed.** Judge errors, timeouts, and unparseable verdicts escalate to a normal permission prompt, never to a silent allow. When the judge was chosen automatically (the session's own model, not a pin), the cascade is retried once against the catalog default before escalating, so a broken or uncredited session model does not by itself force a human decision.
 - **Escalation backstop.** 3 consecutive or 20 total blocks within one user turn escalate to a human prompt rather than looping deny and retry forever.
 - **Per-turn verdict cache.** An identical action and arguments within the same user turn reuses the earlier verdict, so retries do not re-bill the judge.
 - **Anti-workaround denials.** A deny tells the agent not to pursue the same outcome through workarounds or indirect execution.

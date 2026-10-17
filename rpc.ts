@@ -19,6 +19,8 @@ export type JudgeModelRef = {
 /** Current effective options, as returned by `status`. */
 export type StatusInfo = {
   readonly enabled: boolean
+  /** True when the judge is not pinned and follows the session's model. */
+  readonly judgeAuto: boolean
   readonly judge: JudgeModelRef | null
   readonly judge2: JudgeModelRef | null
   readonly twoStage: boolean
@@ -72,10 +74,21 @@ const emptyObject: ObjectSchema = {
   additionalProperties: false,
 }
 
+const statusInput: ObjectSchema = {
+  type: "object",
+  properties: {
+    // Optional: when present, `enabled` reflects that session's override
+    // (per-session switch) instead of the global default.
+    sessionID: { type: "string" },
+  },
+  additionalProperties: false,
+}
+
 const statusOutput: ObjectSchema = {
   type: "object",
   properties: {
     enabled: { type: "boolean" },
+    judgeAuto: { type: "boolean" },
     judge: { anyOf: [{ type: "null" }, modelRef] },
     judge2: { anyOf: [{ type: "null" }, modelRef] },
     twoStage: { type: "boolean" },
@@ -92,7 +105,7 @@ const statusOutput: ObjectSchema = {
     timeoutMs: { type: "number" },
     skipActions: { type: "array", items: { type: "string" } },
   },
-  required: ["enabled", "judge", "judge2", "twoStage", "subagents", "escalate", "timeoutMs", "skipActions"],
+  required: ["enabled", "judgeAuto", "judge", "judge2", "twoStage", "subagents", "escalate", "timeoutMs", "skipActions"],
   additionalProperties: false,
 }
 
@@ -100,6 +113,8 @@ const toggleInput: ObjectSchema = {
   type: "object",
   properties: {
     enabled: { type: "boolean" },
+    // When present, toggles only this session instead of the global default.
+    sessionID: { type: "string" },
   },
   additionalProperties: false,
 }
@@ -152,6 +167,7 @@ const configEvent: ObjectSchema = {
   type: "object",
   properties: {
     enabled: { type: "boolean" },
+    sessionID: { type: "string" },
     judge: modelRef,
     judge2: modelRef,
   },
@@ -163,7 +179,7 @@ export const AutoApprove = Rpc.define({
   id: "auto-approve",
   methods: {
     status: {
-      input: emptyObject,
+      input: statusInput,
       output: statusOutput,
     },
     toggle: {
@@ -177,6 +193,10 @@ export const AutoApprove = Rpc.define({
         invalid: emptyObject,
         unknown_model: emptyObject,
       },
+    },
+    clearJudge: {
+      input: emptyObject,
+      output: emptyObject,
     },
     setJudge2: {
       input: modelRef,

@@ -268,11 +268,39 @@ function asObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
 }
 
+/**
+ * Decision log lives on `globalThis`, not at module scope. The host evaluates
+ * this module once *per location*, so a module-scope array is still one array
+ * per location: the permission hook for session A (location X) writes to X's
+ * copy, while the RPC that serves the TUI queries the default location's copy
+ * (the TUI's own directory) and sees nothing. Sharing through `globalThis`
+ * keeps a single log across every location in the process, so whichever
+ * instance handles the call, the RPC that serves reads sees it. The array is
+ * created once and reused on every subsequent evaluation.
+ */
+const decisions: DecisionRecord[] = ((globalThis as { __autoApproveDecisions?: DecisionRecord[] })
+  .__autoApproveDecisions ??= [])
+
 /** `tui: true` marks that this package ships a TUI half (`./tui`), which the host loads for package installs. */
 const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
   id: "auto-approve",
   tui: true,
   async setup(ctx) {
+    /**
+     * The model catalog moved between OpenCode builds: it is `ctx.catalog.model`
+     * up to 2.0.2 and `ctx.model` from 2.0.26 on. Resolve whichever the running
+     * host exposes so default-judge lookup and judge validation keep working on
+     * both, and raise a clear error instead of a TypeError when neither exists.
+     */
+    const catalogModels = (): (typeof ctx.catalog)["model"] => {
+      const probe = ctx as unknown as { model?: (typeof ctx.catalog)["model"]; catalog?: typeof ctx.catalog }
+      const models = probe.model ?? probe.catalog?.model
+      if (models === undefined) {
+        throw new Error("no model catalog on this OpenCode build (expected ctx.model or ctx.catalog.model)")
+      }
+      return models
+    }
+
     const configRoot = process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config")
     const globalOptionsFile = path.join(configRoot, "opencode", "auto-approve.json")
     const projectOptionsFile = path.join(ctx.location.directory, ".opencode", "auto-approve.json")
@@ -290,8 +318,36 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
       writeFileSync(globalOptionsFile, `${JSON.stringify(merged, null, 2)}\n`)
     }
 
+    const removeGlobalOptions = (keys: ReadonlyArray<string>): void => {
+      const merged = readOptionsFile(globalOptionsFile)
+      for (const key of keys) delete merged[key]
+      writeFileSync(globalOptionsFile, `${JSON.stringify(merged, null, 2)}\n`)
+    }
+
+    // Per-session switch. Overrides are persisted in the options file under a
+    // `sessions` map, so toggling one conversation never touches the others
+    // and survives a server restart. Sessions with no override use the global
+    // `enabled` (or the default) as their baseline.
+    const readSessionEnabled = (sessionID: string | undefined): boolean | undefined => {
+      if (sessionID === undefined) return undefined
+      const sessions = asObject((readOptionsFile(globalOptionsFile) as Record<string, unknown>).sessions)
+      const raw = sessions[sessionID]
+      return typeof raw === "boolean" ? raw : undefined
+    }
+
+    const writeSessionEnabled = (sessionID: string, target: boolean): void => {
+      const file = readOptionsFile(globalOptionsFile)
+      const sessions = asObject(file.sessions)
+      writeFileSync(
+        globalOptionsFile,
+        `${JSON.stringify({ ...file, sessions: { ...sessions, [sessionID]: target } }, null, 2)}\n`,
+      )
+    }
+
+    const effectiveEnabled = (sessionID: string | undefined, options: ResolvedOptions): boolean =>
+      readSessionEnabled(sessionID) ?? options.enabled
+
     const state = new Map<string, TurnState>()
-    const decisions: DecisionRecord[] = []
 
     const turn = (sessionID: string): TurnState => {
       let current = state.get(sessionID)
@@ -304,18 +360,40 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
 
     let memoizedDefaultJudge: JudgeModelRef | undefined
 
-    const resolveJudge = async (options: ResolvedOptions): Promise<JudgeModelRef> => {
-      if (options.judge !== undefined) return options.judge
+    /** The catalog's default model, memoized and resolved without any session. */
+    const resolveDefaultJudge = async (): Promise<JudgeModelRef> => {
       if (memoizedDefaultJudge !== undefined) return memoizedDefaultJudge
-      const defaults = await ctx.catalog.model.default()
+      const defaults = await catalogModels().default()
       const model = defaults.data
       if (model === null) throw new Error("no judge model configured and no default model available")
       memoizedDefaultJudge = { providerID: model.providerID, id: model.id }
       return memoizedDefaultJudge
     }
 
-    const classify = async (evidence: Evidence, options: ResolvedOptions): Promise<Decision> => {
-      const stage1Model = await resolveJudge(options)
+    const resolveJudge = async (options: ResolvedOptions, sessionID?: string): Promise<JudgeModelRef> => {
+      if (options.judge !== undefined) return options.judge
+      // Follow the model the conversation is actually using, when we know the
+      // session. This falls back to the catalog default below for callers that
+      // have no session (for example the status RPC).
+      if (sessionID !== undefined) {
+        try {
+          const session = await ctx.session.get({ sessionID })
+          const model = session.model
+          if (model !== undefined && model !== null) {
+            return { providerID: model.providerID, id: model.id }
+          }
+        } catch {
+          // fall through to the catalog default
+        }
+      }
+      return resolveDefaultJudge()
+    }
+
+    const sameModel = (left: JudgeModelRef, right: JudgeModelRef): boolean =>
+      left.providerID === right.providerID && left.id === right.id
+
+    /** Runs the stage-1 → stage-2 cascade against `stage1Model`; throws on any judge failure. */
+    const runCascade = async (evidence: Evidence, options: ResolvedOptions, stage1Model: JudgeModelRef): Promise<Decision> => {
       const policy = buildPolicy(options)
       const stage1 = await withTimeout(ctx.generate.text({ model: stage1Model, prompt: judgePrompt(policy, evidence, 1) }), options.timeoutMs)
       const first = parseVerdict(stage1.text)
@@ -330,8 +408,33 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
       return { verdict: second, reason: parseReason(stage2.text) || parseReason(stage1.text) }
     }
 
+    const classify = async (evidence: Evidence, options: ResolvedOptions, sessionID?: string): Promise<Decision> => {
+      const primary = await resolveJudge(options, sessionID)
+      try {
+        return await runCascade(evidence, options, primary)
+      } catch (error) {
+        // A judge picked automatically (the session's own model) can fail for
+        // reasons that say nothing about the pending call — a provider error,
+        // a credit limit, or an unusable reply. Before failing closed, retry
+        // once with the catalog default so the call only reaches a human when
+        // no configured judge could judge it. A model the user pinned is left
+        // to fail closed, as configured.
+        if (options.judge !== undefined) throw error
+        const fallback = await resolveDefaultJudge()
+        if (sameModel(fallback, primary)) throw error
+        log(
+          `judge ${primary.providerID}/${primary.id} failed (${
+            error instanceof Error ? error.message : String(error)
+          }); retrying with default ${fallback.providerID}/${fallback.id}`,
+        )
+        return await runCascade(evidence, options, fallback)
+      }
+    }
+
     let emitDecision: ((entry: DecisionRecord) => Promise<void>) | undefined
-    let emitConfig: ((data: { enabled: boolean; judge?: JudgeModelRef; judge2?: JudgeModelRef }) => Promise<void>) | undefined
+    let emitConfig:
+      | ((data: { enabled: boolean; sessionID?: string; judge?: JudgeModelRef; judge2?: JudgeModelRef }) => Promise<void>)
+      | undefined
 
     const record = (entry: DecisionRecord): void => {
       decisions.push(entry)
@@ -352,7 +455,7 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
       }
       const judge: JudgeModelRef = { providerID: input.providerID, id: input.id }
       try {
-        const catalog = await ctx.catalog.model.list()
+        const catalog = await catalogModels().list()
         const models = Array.isArray(catalog) ? catalog : asObject(catalog).data
         const list = Array.isArray(models) ? models : []
         const known = list.some(
@@ -371,14 +474,16 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
     }
 
     const rpcRegistration = await ctx.rpc.register(AutoApprove, {
-      status: async (): Promise<StatusInfo> => {
+      status: async (raw): Promise<StatusInfo> => {
+        const input = asObject(raw)
+        const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
         const options = resolveOptions()
         let judge: JudgeModelRef | null = null
         if (options.judge !== undefined) {
           judge = { providerID: options.judge.providerID, id: options.judge.id }
         } else {
           try {
-            const resolved = await resolveJudge(options)
+            const resolved = await resolveJudge(options, sessionID)
             judge = { providerID: resolved.providerID, id: resolved.id }
           } catch {
             judge = null
@@ -386,7 +491,8 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
         }
         const judge2: JudgeModelRef | null = options.judge2 === undefined ? judge : { providerID: options.judge2.providerID, id: options.judge2.id }
         return {
-          enabled: options.enabled,
+          enabled: effectiveEnabled(sessionID, options),
+          judgeAuto: options.judge === undefined,
           judge,
           judge2,
           twoStage: options.twoStage,
@@ -398,14 +504,26 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
       },
       toggle: async (raw) => {
         const input = asObject(raw)
-        const target = typeof input.enabled === "boolean" ? input.enabled : !resolveOptions().enabled
-        writeGlobalOptions({ enabled: target })
-        log(`toggle → ${target ? "on" : "off"}`)
-        if (emitConfig !== undefined) void emitConfig({ enabled: target }).catch(() => {})
+        const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
+        const target = typeof input.enabled === "boolean" ? input.enabled : !effectiveEnabled(sessionID, resolveOptions())
+        if (sessionID === undefined) {
+          writeGlobalOptions({ enabled: target })
+        } else {
+          writeSessionEnabled(sessionID, target)
+        }
+        log(`toggle → ${target ? "on" : "off"}${sessionID === undefined ? "" : ` (session ${sessionID})`}`)
+        if (emitConfig !== undefined) void emitConfig({ enabled: target, sessionID }).catch(() => {})
         return { enabled: target }
       },
       setJudge: async (raw, rpcContext) => applyJudge(raw, "judge", rpcContext),
       setJudge2: async (raw, rpcContext) => applyJudge(raw, "judge2", rpcContext),
+      clearJudge: async () => {
+        removeGlobalOptions(["judge", "judge2"])
+        memoizedDefaultJudge = undefined
+        log("judge → auto (follow session)")
+        if (emitConfig !== undefined) void emitConfig({ enabled: resolveOptions().enabled }).catch(() => {})
+        return {}
+      },
       decisions: async (raw) => {
         const input = asObject(raw)
         const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
@@ -436,7 +554,7 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
       if (event.effect !== "allow") return
 
       const options = resolveOptions()
-      if (!options.enabled) return
+      if (!effectiveEnabled(event.sessionID, options)) return
       if (options.skipActions.has(event.action)) return
 
       const started = Date.now()
@@ -485,7 +603,7 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
         const key = `${event.action}\u0000${event.resources.join("\u0001")}`
         let decision = current.cache.get(key)
         if (decision === undefined) {
-          decision = await classify(evidence, options)
+          decision = await classify(evidence, options, event.sessionID)
           current.cache.set(key, decision)
         }
 
@@ -537,7 +655,6 @@ const definition: Parameters<typeof Plugin.define>[0] & { tui: boolean } = {
 
     return () => {
       state.clear()
-      decisions.length = 0
       void rpcRegistration.dispose()
       void permissionRegistration.dispose()
     }
